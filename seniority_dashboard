@@ -1,0 +1,1472 @@
+"""
+seniority_dashboard.py
+======================
+Government Employee Seniority Ranking Dashboard.
+
+COMPARISON UX REDESIGN (this version)
+--------------------------------------
+Instead of a hard-to-read text blob in the table cell, comparison data is now shown
+in a beautiful MODAL POPUP:
+  - Click any row in the Seniority List → a popup opens
+  - Each seniority tier is rendered as its own colour-coded card
+  - Employees being compared are shown as a clean mini-table per tier
+  - A clear "✅ RESOLVED HERE" badge marks the deciding tier
+  - The table itself only shows a compact "Tie Group" badge + tier label (clean & scannable)
+
+HOW TO RUN:
+    pip install dash dash-bootstrap-components plotly pandas
+    python seniority_dashboard.py
+
+CSV FILES NEEDED (same folder):
+    temp_emp_data.csv  |  temp_promotion.csv  |  temp_reappointment.csv
+"""
+
+import os, json
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import dash
+from dash import dcc, html, dash_table, Input, Output, State
+import dash_bootstrap_components as dbc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLOUR PALETTE
+# ─────────────────────────────────────────────────────────────────────────────
+P = {
+    "navy": "#0A2342", "teal": "#1ABC9C", "gold": "#F39C12", "slate": "#2C3E50",
+    "card":  "#1E2D40", "even": "#1A2535", "odd": "#223044",
+    "border":"#2E4057", "text": "#ECF0F1", "muted":"#95A5A6",
+}
+TIER_COLORS = {
+    1: "#3498DB", 2: "#2ECC71", 3: "#9B59B6",
+    4: "#F39C12", 5: "#E74C3C", 6: "#95A5A6",
+}
+TIER_ICONS  = {1:"layer-group", 2:"calendar-day", 3:"history",
+               4:"door-open",   5:"birthday-cake", 6:"hashtag"}
+CHART_BASE  = dict(
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color=P["text"], family="Segoe UI"),
+    margin=dict(l=40,r=20,t=40,b=40),
+    xaxis=dict(gridcolor=P["border"], zerolinecolor=P["border"]),
+    yaxis=dict(gridcolor=P["border"], zerolinecolor=P["border"]),
+)
+DQ_ICON = {"error":("times-circle","#E74C3C"), "warning":("exclamation-triangle","#F39C12"),
+           "info":("info-circle","#3498DB"),    "success":("check-circle","#2ECC71")}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SENIORITY ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+def build_seniority_report(emp_csv, promo_csv, reapp_csv):
+    emp   = pd.read_csv(emp_csv,   parse_dates=["DateOfBirth","dateofentryingov","DateOfJoining"])
+    promo = pd.read_csv(promo_csv, parse_dates=["dateofpromotion"])
+    reapp = pd.read_csv(reapp_csv, parse_dates=["dateofreappoitment"])
+    combined = emp.merge(promo, on="ArfNo", how="left").merge(reapp, on="ArfNo", how="left")
+
+    # all_bps_events
+    def mk(df, date_col, bps_col, src, name_df=None):
+        d = df[df[date_col].notna() & df[bps_col].notna()].copy()
+        if name_df is not None:
+            d = d.merge(name_df[["ArfNo","Namee"]], on="ArfNo", how="left")
+        d = d[["ArfNo","Namee",date_col,bps_col]].copy()
+        d.columns = ["ArfNo","Namee","event_date","bps_level"]
+        d["source"] = src
+        return d
+
+    all_events = pd.concat([
+        mk(emp,   "DateOfJoining",      "DateOfJoiningbps",      "Joining"),
+        mk(reapp, "dateofreappoitment", "dateofreappoitmentbps", "Reappointment", emp),
+        mk(promo, "dateofpromotion",    "dateofpromotionbps",    "Promotion",     emp),
+    ], ignore_index=True)
+    all_events["bps_level"] = all_events["bps_level"].astype(int)
+
+    # bps_earliest
+    bps_earliest = all_events.groupby(["ArfNo","bps_level"])["event_date"].min().reset_index()
+    bps_earliest.rename(columns={"event_date":"achieved_date"}, inplace=True)
+
+    # seniority_paths  (inverted-BPS + inverted-date countdown for correct DESC sort)
+    FAR = pd.Timestamp("2099-12-31")
+
+    def make_path(grp):
+        g = grp.sort_values("bps_level", ascending=False)
+        return "_".join(f"{100-int(r.bps_level):02d}-{(FAR-r.achieved_date).days:06d}"
+                        for r in g.itertuples())
+
+    paths    = bps_earliest.groupby("ArfNo")[["bps_level","achieved_date"]] \
+                           .apply(make_path, include_groups=False).reset_index()
+    paths.columns = ["ArfNo","seniority_path"]
+
+    max_bps  = all_events.groupby("ArfNo")["bps_level"].max().reset_index(name="max_bps")
+    peak_dt  = bps_earliest.merge(max_bps, on="ArfNo")
+    peak_dt  = peak_dt[peak_dt["bps_level"]==peak_dt["max_bps"]] \
+                       .groupby("ArfNo")["achieved_date"].min().reset_index(name="highest_bps_date")
+
+    sp = paths.merge(max_bps.rename(columns={"max_bps":"highest_bps"}), on="ArfNo").merge(peak_dt, on="ArfNo")
+
+    emp_base = combined.groupby("ArfNo").agg(
+        Namee=("Namee","first"),
+        dateofentryingov=("dateofentryingov","min"),
+        DateOfBirth=("DateOfBirth","min")
+    ).reset_index()
+
+    tracking = sp.merge(emp_base, on="ArfNo")
+    tracking["_pad"] = tracking["seniority_path"].apply(lambda p: p.ljust(500,"~"))
+    sf = tracking.sort_values(["_pad","dateofentryingov","DateOfBirth","ArfNo"],
+                              ascending=[False,True,True,True]).reset_index(drop=True)
+    sf["seniority_rank"] = range(1, len(sf)+1)
+    sf.drop(columns=["_pad"], inplace=True)
+
+    # readable path
+    def decode(path):
+        parts = []
+        for seg in path.split("_"):
+            pp, cd = seg.split("-",1)
+            parts.append(f"BPS-{100-int(pp)}: {(FAR-pd.Timedelta(days=int(cd))).strftime('%d-%b-%Y')}")
+        return " → ".join(parts)
+    sf["seniority_path_readable"] = sf["seniority_path"].apply(decode)
+
+    # decision_basis
+    bps_cnt  = sf.groupby("highest_bps")["ArfNo"].count().to_dict()
+    path_ent = sf.groupby(["seniority_path","dateofentryingov"])["ArfNo"].count()
+    path_dob = sf.groupby(["seniority_path","dateofentryingov","DateOfBirth"])["ArfNo"].count()
+
+    def decide(row):
+        segs = row["seniority_path"].split("_")
+        bps  = row["highest_bps"]
+        dfmt = lambda d: pd.to_datetime(d).strftime("%d-%b-%Y") if pd.notna(d) else "N/A"
+        bd   = next((d for d in range(1,len(segs)+1)
+                     if sf["seniority_path"].str.startswith("_".join(segs[:d])).sum()==1), None)
+        if bd==1 and bps_cnt.get(bps,0)==1: return f"Unique at BPS {bps}"
+        if bd==1: return f"Broke at L1 BPS {bps} date ({dfmt(row['highest_bps_date'])})"
+        if bd is not None:
+            seg=segs[bd-1]; sb=100-int(seg.split("-")[0])
+            sd=(FAR-pd.Timedelta(days=int(seg.split("-",1)[1]))).strftime("%d-%b-%Y")
+            return f"Broke at L{bd} BPS {sb} date ({sd})"
+        if path_ent.get((row["seniority_path"],row["dateofentryingov"]),0)==1:
+            return f"Broke by govt entry date ({dfmt(row['dateofentryingov'])})"
+        if path_dob.get((row["seniority_path"],row["dateofentryingov"],row["DateOfBirth"]),0)==1:
+            return f"Broke by date of birth ({dfmt(row['DateOfBirth'])})"
+        return f"Broke by ArfNo ({row['ArfNo']})"
+
+    sf["decision_basis"] = sf.apply(decide, axis=1)
+
+    # ── STRUCTURED COMPARISON DATA (stored as JSON per employee) ─────────────
+    # Each employee gets a list of tier dicts:
+    #   {"tier":1, "title":"Same BPS 15", "field_value":"BPS 15",
+    #    "resolved":False/True, "employees":[{"name","rank","detail"},…]}
+    dfmt = lambda d: pd.Timestamp(d).strftime("%d-%b-%Y") if pd.notna(d) else "N/A"
+
+    def build_comparison_json(row):
+        arf   = row["ArfNo"]
+        bps   = row["highest_bps"]
+        bdate = row["highest_bps_date"]
+        path  = row["seniority_path"]
+        entry = row["dateofentryingov"]
+        dob   = row["DateOfBirth"]
+        tiers = []
+
+        # Tier 1 — same peak BPS
+        t1 = sf[(sf["highest_bps"]==bps) & (sf["ArfNo"]!=arf)]
+        t1_emps = [{"name":r.Namee, "rank":int(r.seniority_rank),
+                    "detail":f"BPS {r.highest_bps}  ·  reached {dfmt(r.highest_bps_date)}"}
+                   for r in t1.sort_values("seniority_rank").itertuples()]
+        resolved_t1 = t1.empty
+        tiers.append({"tier":1, "title":f"Same Peak BPS {bps}",
+                      "field_value":f"BPS {bps}", "resolved":resolved_t1,
+                      "employees":t1_emps,
+                      "note":"No one else reached this BPS level — unique." if resolved_t1
+                             else f"{len(t1_emps)} employee(s) share this peak BPS level."})
+        if resolved_t1:
+            return json.dumps(tiers)
+
+        # Tier 2 — same BPS + same peak date
+        t2 = t1[t1["highest_bps_date"]==bdate]
+        t2_emps = [{"name":r.Namee, "rank":int(r.seniority_rank),
+                    "detail":f"BPS {r.highest_bps}  ·  {dfmt(r.highest_bps_date)}"}
+                   for r in t2.sort_values("seniority_rank").itertuples()]
+        resolved_t2 = t2.empty
+        tiers.append({"tier":2, "title":f"Same BPS {bps} Achievement Date",
+                      "field_value":dfmt(bdate), "resolved":resolved_t2,
+                      "employees":t2_emps,
+                      "note":f"Date {dfmt(bdate)} is unique within BPS {bps} group — rank resolved here."
+                              if resolved_t2
+                              else f"{len(t2_emps)} employee(s) also reached BPS {bps} on {dfmt(bdate)}."})
+        if resolved_t2:
+            return json.dumps(tiers)
+
+        # Tier 3 — same full career path
+        t3 = sf[(sf["seniority_path"]==path) & (sf["ArfNo"]!=arf)]
+        t3_emps = [{"name":r.Namee, "rank":int(r.seniority_rank),
+                    "detail":r.seniority_path_readable}
+                   for r in t3.sort_values("seniority_rank").itertuples()]
+        resolved_t3 = t3.empty
+        tiers.append({"tier":3, "title":"Full Career Path (all BPS levels + dates)",
+                      "field_value":"Entire path", "resolved":resolved_t3,
+                      "employees":t3_emps,
+                      "note":"Full career path is unique within the tied group — rank resolved here."
+                              if resolved_t3
+                              else f"{len(t3_emps)} employee(s) share an identical full career path."})
+        if resolved_t3:
+            return json.dumps(tiers)
+
+        # Tier 4 — same path + entry date
+        t4 = t3[t3["dateofentryingov"]==entry]
+        t4_emps = [{"name":r.Namee, "rank":int(r.seniority_rank),
+                    "detail":f"Govt entry: {dfmt(r.dateofentryingov)}"}
+                   for r in t4.sort_values("seniority_rank").itertuples()]
+        resolved_t4 = t4.empty
+        tiers.append({"tier":4, "title":"Government Entry Date",
+                      "field_value":dfmt(entry), "resolved":resolved_t4,
+                      "employees":t4_emps,
+                      "note":f"Entry date {dfmt(entry)} is unique within the group — rank resolved here."
+                              if resolved_t4
+                              else f"{len(t4_emps)} employee(s) also entered government on {dfmt(entry)}."})
+        if resolved_t4:
+            return json.dumps(tiers)
+
+        # Tier 5 — same path + entry + DOB
+        t5 = t4[t4["DateOfBirth"]==dob]
+        t5_emps = [{"name":r.Namee, "rank":int(r.seniority_rank),
+                    "detail":f"DOB: {dfmt(r.DateOfBirth)}"}
+                   for r in t5.sort_values("seniority_rank").itertuples()]
+        resolved_t5 = t5.empty
+        tiers.append({"tier":5, "title":"Date of Birth",
+                      "field_value":dfmt(dob), "resolved":resolved_t5,
+                      "employees":t5_emps,
+                      "note":f"Date of birth {dfmt(dob)} is unique — rank resolved here."
+                              if resolved_t5
+                              else f"{len(t5_emps)} employee(s) also born on {dfmt(dob)}."})
+        if resolved_t5:
+            return json.dumps(tiers)
+
+        # Tier 6 — ArfNo
+        tiers.append({"tier":6, "title":"ArfNo (absolute fallback)",
+                      "field_value":str(arf), "resolved":True,
+                      "employees":[],
+                      "note":f"All fields identical. Smallest ArfNo wins — this employee's ArfNo is {arf}."})
+        return json.dumps(tiers)
+
+    sf["comparison_json"] = sf.apply(build_comparison_json, axis=1)
+    sf["tied_group_size"] = sf.groupby(["highest_bps","highest_bps_date"])["ArfNo"].transform("count")
+
+    def tier_label(d):
+        if "Unique at BPS"  in d: return "Tier 1 – Unique BPS"
+        if "Broke at L1"    in d: return "Tier 2 – BPS Date"
+        if "Broke at L"     in d: return "Tier 3 – Career Depth"
+        if "entry date"     in d: return "Tier 4 – Govt Entry"
+        if "date of birth"  in d: return "Tier 5 – DOB"
+        return "Tier 6 – ArfNo"
+    sf["tier_label"] = sf["decision_basis"].apply(tier_label)
+
+    sf = sf.merge(emp[["ArfNo","Trade","qualification"]], on="ArfNo", how="left")
+    return sf, all_events, emp, promo, reapp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA QUALITY CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+def run_dq(emp, promo, reapp, all_events):
+    issues = []
+    emp_arfs = set(emp["ArfNo"])
+    checks = [
+        ("warning", "Missing Date of Birth",    emp[emp["DateOfBirth"].isna()]),
+        ("warning", "Missing Govt Entry Date",  emp[emp["dateofentryingov"].isna()]),
+        ("info",    "Missing Qualification",    emp[emp["qualification"].isna()]),
+    ]
+    for level, title, bad in checks:
+        if len(bad):
+            issues.append((level, title, f"{len(bad)} employee(s): "+", ".join(bad["Namee"].astype(str))))
+    for label, tbl in [("Promotions", promo), ("Reappointments", reapp)]:
+        orphans = set(tbl["ArfNo"]) - emp_arfs
+        if orphans:
+            issues.append(("error", f"Orphan ArfNo in {label}", f"ArfNos {sorted(orphans)} not in master"))
+    dup = promo[promo.duplicated(subset=["ArfNo","dateofpromotionbps"], keep=False)]
+    if len(dup):
+        issues.append(("warning","Duplicate Promotion Entries", f"{len(dup)} row(s) with same ArfNo+BPS"))
+    reg = [f"{g['Namee'].iloc[0]} ({a})" for a,g in all_events.groupby("ArfNo")
+           if any(g.sort_values("event_date")["bps_level"].diff().dropna()<0)]
+    if reg: issues.append(("error","BPS Regression",", ".join(reg)))
+    nog = [f"{g['Namee'].iloc[0]} ({a})" for a,g in all_events.groupby("ArfNo")
+           if g["source"].nunique()==1 and g["source"].iloc[0]=="Joining"]
+    if nog: issues.append(("info","No Progression Recorded",", ".join(nog)))
+    if not issues: issues.append(("success","All checks passed","No data quality issues found."))
+    return issues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+BASE = os.path.dirname(os.path.abspath(__file__))
+report, all_events, emp_raw, promo_raw, reapp_raw = build_seniority_report(
+    os.path.join(BASE,"temp_emp_data.csv"),
+    os.path.join(BASE,"temp_promotion.csv"),
+    os.path.join(BASE,"temp_reappointment.csv"),
+)
+DQ = run_dq(emp_raw, promo_raw, reapp_raw, all_events)
+
+report["dob_fmt"]   = pd.to_datetime(report["DateOfBirth"]).dt.strftime("%d-%b-%Y")
+report["entry_fmt"] = pd.to_datetime(report["dateofentryingov"]).dt.strftime("%d-%b-%Y")
+report["bps_date_fmt"] = pd.to_datetime(report["highest_bps_date"]).dt.strftime("%d-%b-%Y")
+report["tie_fmt"]   = report["tied_group_size"].apply(
+    lambda n: "Unique" if n==1 else f"Tied ×{int(n)}")
+
+BPS_WITH_DATA = sorted(all_events["bps_level"].unique())
+QUAL_OPTS     = sorted(report["qualification"].dropna().unique())
+
+TIER_LABEL_COLORS = {
+    "Tier 1 – Unique BPS":"#2ECC71", "Tier 2 – BPS Date":"#3498DB",
+    "Tier 3 – Career Depth":"#9B59B6","Tier 4 – Govt Entry":"#F39C12",
+    "Tier 5 – DOB":"#E74C3C",         "Tier 6 – ArfNo":"#95A5A6",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPARISON MODAL RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
+def render_comparison_modal(arf):
+    """Build the modal body for a given ArfNo — a beautiful tier-by-tier breakdown."""
+    row = report[report["ArfNo"]==arf].iloc[0]
+    tiers = json.loads(row["comparison_json"])
+
+    # Summary header card
+    n_tiers_checked = len(tiers)
+    resolving_tier  = next((t for t in tiers if t["resolved"]), tiers[-1])
+    tier_color = TIER_COLORS.get(resolving_tier["tier"], P["muted"])
+
+    header = dbc.Card([
+        dbc.CardBody(dbc.Row([
+            dbc.Col([
+                html.H5(row["Namee"], style={"color":P["text"],"fontWeight":"700","marginBottom":"4px"}),
+                html.Div([
+                    dbc.Badge(f"Rank #{row['seniority_rank']}", color="info",  className="me-2"),
+                    dbc.Badge(f"BPS {row['highest_bps']}",     color="warning",className="me-2"),
+                    dbc.Badge(row["qualification"],             color="secondary", className="me-2"),
+                ]),
+            ], md=7),
+            dbc.Col([
+                html.Div([
+                    html.Span("Rank decided by ",style={"color":P["muted"],"fontSize":"0.85rem"}),
+                    dbc.Badge(
+                        f"Tier {resolving_tier['tier']} — {resolving_tier['title']}",
+                        style={"backgroundColor":tier_color,"fontSize":"0.82rem"},
+                        className="me-2",
+                    ),
+                ], className="mb-1"),
+                html.Div(row["decision_basis"],
+                         style={"color":tier_color,"fontSize":"0.82rem","fontStyle":"italic"}),
+            ], md=5),
+        ])),
+    ], style={"background":P["slate"],"border":f"2px solid {tier_color}","marginBottom":"16px"})
+
+    # Career path pill strip
+    path_strip = html.Div([
+        html.Span("Career Path: ", style={"color":P["muted"],"fontSize":"0.8rem","marginRight":"8px"}),
+        *[dbc.Badge(seg.strip(), color="info", className="me-1 mb-1", style={"fontSize":"0.78rem"})
+          for seg in row["seniority_path_readable"].split("→")],
+    ], className="mb-3")
+
+    # Tier cards
+    tier_cards = []
+    for t in tiers:
+        tc = TIER_COLORS.get(t["tier"], P["muted"])
+        emps = t["employees"]
+        is_resolved = t["resolved"]
+
+        # Employee mini-table inside the tier card
+        if emps:
+            emp_rows = [
+                html.Tr([
+                    html.Td(f"#{e['rank']}",
+                            style={"color":P["teal"],"fontWeight":"700","width":"50px","padding":"6px 10px"}),
+                    html.Td(e["name"],
+                            style={"color":P["text"],"fontWeight":"600","padding":"6px 10px"}),
+                    html.Td(e["detail"],
+                            style={"color":P["muted"],"fontSize":"0.82rem","padding":"6px 10px"}),
+                ], style={"borderBottom":f"1px solid {P['border']}"})
+                for e in emps
+            ]
+            emp_table = html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Rank", style={"color":tc,"padding":"6px 10px","width":"50px"}),
+                    html.Th("Name", style={"color":tc,"padding":"6px 10px"}),
+                    html.Th("Details", style={"color":tc,"padding":"6px 10px"}),
+                ], style={"borderBottom":f"2px solid {tc}"})),
+                html.Tbody(emp_rows),
+            ], style={"width":"100%","borderCollapse":"collapse","fontSize":"0.86rem"})
+        else:
+            emp_table = None
+
+        # Resolution badge
+        status = html.Div([
+            html.Span("✅ RESOLVED HERE — ",
+                      style={"color":"#2ECC71","fontWeight":"700","fontSize":"0.85rem"})
+            if is_resolved else
+            html.Span("⬇ Still tied — checking next tier",
+                      style={"color":P["muted"],"fontWeight":"600","fontSize":"0.82rem"}),
+            html.Span(t["note"], style={"color":P["muted"],"fontSize":"0.82rem","marginLeft":"6px"}),
+        ], style={"marginTop":"8px","padding":"8px 0",
+                  "borderTop":f"1px solid {P['border']}"})
+
+        card = dbc.Card([
+            dbc.CardHeader(dbc.Row([
+                dbc.Col([
+                    html.I(className=f"fas fa-{TIER_ICONS.get(t['tier'],'circle')} me-2",
+                           style={"color":tc}),
+                    html.Span(f"Tier {t['tier']}",
+                              style={"color":tc,"fontWeight":"800","marginRight":"8px"}),
+                    html.Span(t["title"],
+                              style={"color":P["text"],"fontWeight":"600"}),
+                ], md=8),
+                dbc.Col([
+                    dbc.Badge(
+                        f"Value: {t['field_value']}",
+                        style={"backgroundColor":tc+"33","color":tc,
+                               "border":f"1px solid {tc}","fontSize":"0.78rem"},
+                    )
+                ], md=4, style={"textAlign":"right"}),
+            ]), style={"background":tc+"22","borderBottom":f"1px solid {tc}"}),
+            dbc.CardBody([
+                emp_table if emp_table else
+                html.Div("No other employees to compare at this tier.",
+                         style={"color":P["muted"],"fontSize":"0.83rem","fontStyle":"italic"}),
+                status,
+            ]),
+        ], style={
+            "background":P["even"],
+            "border":f"2px solid {tc}" if is_resolved else f"1px solid {P['border']}",
+            "marginBottom":"10px",
+            "boxShadow":f"0 0 12px {tc}55" if is_resolved else "none",
+        })
+        tier_cards.append(card)
+
+    return html.Div([header, path_strip, *tier_cards])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GROUP CASCADE — walks an ENTIRE tied group through all 6 tiers at once,
+# showing exactly which employees split away from which at every step.
+# ─────────────────────────────────────────────────────────────────────────────
+CASCADE_STEPS = [
+    (1, "Peak BPS",                  "highest_bps"),
+    (2, "Peak BPS Achievement Date", "bps_date_fmt"),
+    (3, "Full Career Path",          "seniority_path_readable"),
+    (4, "Government Entry Date",     "entry_fmt"),
+    (5, "Date of Birth",             "dob_fmt"),
+    (6, "ArfNo (final fallback)",    "ArfNo"),
+]
+
+def build_group_cascade(arf_list):
+    """Given a list of ArfNos that started tied (same peak BPS + date), walk them
+    through every tier, splitting the group at each step, until every member is
+    uniquely resolved. Returns a list of step dicts for rendering."""
+    df = report[report["ArfNo"].isin(arf_list)].sort_values("seniority_rank").copy()
+    current_groups = [df]
+    cascade = []
+    for tier_no, title, field in CASCADE_STEPS:
+        splits, still_tied = [], []
+        for g in current_groups:
+            for val, sub in g.groupby(field, sort=False):
+                splits.append({"value": val, "members": sub.sort_values("seniority_rank"),
+                               "resolved": len(sub) == 1})
+                if len(sub) > 1:
+                    still_tied.append(sub)
+        cascade.append({"tier": tier_no, "title": title, "field": field, "splits": splits})
+        current_groups = still_tied
+        if not current_groups:
+            break
+    return cascade
+
+
+def full_career_str(arf):
+    """Every BPS event for this employee, in order, with source — the real 'BPS history'
+    (joining grade, every promotion, every reappointment) rather than just the summarised path."""
+    evts = all_events[all_events["ArfNo"] == arf].sort_values("event_date")
+    if evts.empty:
+        return html.Span("No events on record", style={"color": P["muted"]})
+    return html.Div([
+        dbc.Badge(f"{e.source}: BPS {int(e.bps_level)}  ({e.event_date.strftime('%d-%b-%Y')})",
+                  className="me-1 mb-1",
+                  style={"fontSize": "0.72rem", "backgroundColor": P["slate"], "color": P["text"],
+                         "border": f"1px solid {P['border']}"})
+        for e in evts.itertuples()
+    ])
+
+# (label, value-getter, field-key this row is keyed to in CASCADE_STEPS — None if not a tiebreak field)
+COMPARISON_ROWS = [
+    ("Qualification",    lambda r: r.qualification,        None),
+    ("Peak BPS",         lambda r: f"BPS {r.highest_bps}",  "highest_bps"),
+    ("Peak BPS Date",    lambda r: r.bps_date_fmt,          "bps_date_fmt"),
+    ("Full BPS History", lambda r: full_career_str(r.ArfNo),"seniority_path_readable"),
+    ("Government Entry", lambda r: r.entry_fmt,             "entry_fmt"),
+    ("Date of Birth",    lambda r: r.dob_fmt,                "dob_fmt"),
+    ("ArfNo",            lambda r: str(r.ArfNo),             "ArfNo"),
+]
+
+def render_group_table(members_df, active_field=None):
+    """Side-by-side comparison: one COLUMN per employee, one ROW per attribute
+    (qualification, peak BPS, full BPS history, entry date, DOB, ArfNo).
+    The row matching `active_field` is highlighted gold; within that row, cells
+    that still match another employee turn amber ('🔗 still tied'), cells that
+    are unique in the group turn green ('✅ splits off') — so you can see, at a
+    glance, exactly which employees are being compared and on what value."""
+    people = list(members_df.itertuples())
+    header = html.Tr(
+        [html.Th("Attribute", style={"color": P["muted"], "padding": "6px 10px",
+                                      "background": P["slate"], "textAlign": "left",
+                                      "fontSize": "0.72rem", "textTransform": "uppercase"})] +
+        [html.Th([html.Div(f"#{p.seniority_rank}  ·  ArfNo {p.ArfNo}",
+                            style={"color": P["teal"], "fontWeight": "800", "fontSize": "0.72rem"}),
+                  html.Div(p.Namee, style={"color": P["text"], "fontWeight": "700", "fontSize": "0.88rem"})],
+                 style={"padding": "6px 10px", "background": P["slate"], "textAlign": "left"})
+         for p in people]
+    )
+    body_rows = []
+    for label, getter, field in COMPARISON_ROWS:
+        raw_vals = [getter(p) for p in people]
+        is_active = field is not None and field == active_field
+        dup_ok = all(isinstance(v, str) for v in raw_vals)   # only plain strings are diffable inline
+        counts = {}
+        if dup_ok:
+            for v in raw_vals:
+                counts[v] = counts.get(v, 0) + 1
+        cells = [html.Td(label, style={"color": P["muted"], "fontWeight": "700", "padding": "6px 10px",
+                                        "fontSize": "0.8rem", "whiteSpace": "nowrap",
+                                        "borderTop": f"2px solid {P['gold']}" if is_active else "none"})]
+        for v in raw_vals:
+            marker, bg, bd = None, "transparent", P["border"]
+            if is_active and dup_ok:
+                shared = counts[v] > 1
+                bg = "#E74C3C22" if shared else "#2ECC7122"
+                bd = "#E74C3C" if shared else "#2ECC71"
+                marker = "🔗 still tied" if shared else "✅ splits off here"
+            cells.append(html.Td([
+                v,
+                html.Div(marker, style={"fontSize": "0.68rem", "color": bd, "fontWeight": "700",
+                                         "marginTop": "3px"}) if marker else None,
+            ], style={"padding": "6px 10px", "fontSize": "0.82rem", "color": P["text"], "background": bg,
+                       "border": f"1px solid {bd}" if is_active else "1px solid transparent",
+                       "borderTop": f"2px solid {P['gold']}" if is_active else "none",
+                       "verticalAlign": "top"}))
+        body_rows.append(html.Tr(cells, style={"borderBottom": f"1px solid {P['border']}"}))
+    return html.Table([html.Thead(header), html.Tbody(body_rows)],
+                       style={"width": "100%", "borderCollapse": "collapse", "marginBottom": "16px"})
+
+
+def render_cascade(cascade, header_label=""):
+    """Walk the tiers: for every still-tied cluster entering a tier, show a full
+    side-by-side comparison table (who's being compared, on what data) with the
+    deciding row highlighted, then whoever splits off is marked resolved and
+    whoever remains tied carries on into the next tier's table."""
+    blocks = []
+    if header_label:
+        blocks.append(html.H6(header_label, style={"color": P["gold"], "fontWeight": "700",
+                                                     "marginBottom": "10px"}))
+    for step in cascade:
+        tc = TIER_COLORS.get(step["tier"], P["muted"])
+        clusters     = [s["members"] for s in step["splits"] if len(s["members"]) > 1]
+        resolved_now = [s["members"] for s in step["splits"] if len(s["members"]) == 1]
+
+        card_body = []
+        if clusters:
+            for cl in clusters:
+                card_body.append(html.Div(
+                    f"Comparing {len(cl)} employees still tied going into this tier:",
+                    style={"color": P["muted"], "fontSize": "0.82rem", "marginBottom": "6px"}))
+                card_body.append(render_group_table(cl, active_field=step["field"]))
+
+        if resolved_now:
+            names = ", ".join(f"{f.iloc[0]['Namee']} (#{int(f.iloc[0]['seniority_rank'])})" for f in resolved_now)
+            card_body.append(html.Div([
+                html.I(className="fas fa-check-circle me-2", style={"color": "#2ECC71"}),
+                html.Span(f"Resolved at this tier: {names}", style={"color": "#2ECC71", "fontSize": "0.82rem"}),
+            ], style={"marginTop": "4px", "marginBottom": "4px"}))
+
+        card = dbc.Card([
+            dbc.CardHeader([
+                html.I(className=f"fas fa-{TIER_ICONS.get(step['tier'], 'circle')} me-2", style={"color": tc}),
+                html.Span(f"Tier {step['tier']}", style={"color": tc, "fontWeight": "800", "marginRight": "8px"}),
+                html.Span(step["title"], style={"color": P["text"], "fontWeight": "600"}),
+            ], style={"background": tc + "22", "borderBottom": f"1px solid {tc}"}),
+            dbc.CardBody(card_body if card_body else
+                         html.Div("Nothing left to compare — fully resolved above.",
+                                  style={"color": P["muted"], "fontStyle": "italic", "fontSize": "0.82rem"})),
+        ], style={"background": P["card"], "border": f"1px solid {P['border']}", "marginBottom": "10px"})
+        blocks.append(card)
+
+        if not clusters:
+            blocks.append(html.Div([
+                html.I(className="fas fa-flag-checkered me-2", style={"color": "#2ECC71"}),
+                html.Span("Every employee in this group is fully resolved.",
+                          style={"color": "#2ECC71", "fontWeight": "600"}),
+            ], className="mb-3"))
+            break
+    return html.Div(blocks)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def stat_card(title, value, icon, color):
+    return dbc.Card([dbc.CardBody(html.Div([
+        html.Div([
+            html.P(title, className="mb-0",
+                   style={"color":P["muted"],"fontSize":"0.78rem",
+                          "textTransform":"uppercase","letterSpacing":"0.08em"}),
+            html.H3(str(value), className="mb-0",
+                    style={"color":P["text"],"fontWeight":"700"}),
+        ]),
+        html.I(className=f"fas fa-{icon} fa-2x", style={"color":color,"opacity":"0.8"}),
+    ], style={"display":"flex","justifyContent":"space-between","alignItems":"center"}))],
+    style={"background":P["card"],"border":f"1px solid {color}",
+           "borderLeft":f"4px solid {color}","borderRadius":"8px"})
+
+def dq_alert(level, title, detail):
+    icon, color = DQ_ICON[level]
+    return dbc.Alert([
+        html.I(className=f"fas fa-{icon} me-2", style={"color":color}),
+        html.B(title+": ", style={"color":color}),
+        html.Span(detail, style={"color":P["text"]}),
+    ], style={"background":"#1A2535","border":f"1px solid {color}"}, className="mb-2")
+
+def raw_tbl(df, tid):
+    return dash_table.DataTable(
+        id=tid, data=df.astype(str).to_dict("records"),
+        columns=[{"name":c,"id":c} for c in df.columns],
+        page_size=10, sort_action="native", filter_action="native",
+        style_table={"overflowX":"auto"},
+        style_header={"backgroundColor":P["slate"],"color":P["teal"],"fontWeight":"700",
+                      "border":f"1px solid {P['border']}","fontSize":"0.75rem"},
+        style_cell={"backgroundColor":P["even"],"color":P["text"],
+                    "border":f"1px solid {P['border']}","fontSize":"0.8rem","padding":"6px 10px"},
+        style_data_conditional=[{"if":{"row_index":"odd"},"backgroundColor":P["odd"]}],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPARISON MODAL COMPONENT
+# ─────────────────────────────────────────────────────────────────────────────
+comparison_modal = dbc.Modal([
+    dbc.ModalHeader([
+        html.I(className="fas fa-balance-scale me-2", style={"color":P["gold"]}),
+        html.Span(id="modal-title",
+                  style={"color":P["gold"],"fontWeight":"700","fontSize":"1.05rem"}),
+    ], style={"background":P["navy"],"borderBottom":f"2px solid {P['gold']}"}),
+    dbc.ModalBody(
+        html.Div(id="modal-body",
+                 style={"background":P["navy"],"padding":"0"}),
+        style={"background":P["navy"],"maxHeight":"78vh","overflowY":"auto"},
+    ),
+    dbc.ModalFooter([
+        html.Small("Click any row in the Seniority List to compare a different employee.",
+                   style={"color":P["muted"]}),
+        dbc.Button("Close", id="modal-close", color="secondary", size="sm"),
+    ], style={"background":P["navy"],"borderTop":f"1px solid {P['border']}"}),
+], id="comparison-modal", size="xl", is_open=False,
+   style={"--bs-modal-bg":P["navy"]})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILTER BAR
+# ─────────────────────────────────────────────────────────────────────────────
+filter_bar = dbc.Card([dbc.CardBody(dbc.Row([
+    dbc.Col([
+        html.Label("Search Name / ArfNo",style={"color":P["muted"],"fontSize":"0.8rem"}),
+        dbc.Input(id="search-input", placeholder="Type to search…", debounce=True,
+                  style={"background":"#1A2535","color":P["text"],"border":f"1px solid {P['border']}"}),
+    ], md=4),
+    dbc.Col([
+        html.Label("BPS Level",style={"color":P["muted"],"fontSize":"0.8rem"}),
+        dcc.Dropdown(id="bps-filter",
+            options=[{"label":f"BPS {b}"+(""if b in BPS_WITH_DATA else" (no data)"),
+                      "value":b,"disabled":b not in BPS_WITH_DATA} for b in range(1,23)],
+            multi=True, placeholder="All BPS levels",
+            style={"background":"#1A2535","color":"#000"}),
+    ], md=3),
+    dbc.Col([
+        html.Label("Qualification",style={"color":P["muted"],"fontSize":"0.8rem"}),
+        dcc.Dropdown(id="qual-filter",
+            options=[{"label":q,"value":q} for q in QUAL_OPTS],
+            multi=True, placeholder="All qualifications",
+            style={"background":"#1A2535","color":"#000"}),
+    ], md=3),
+    dbc.Col([
+        html.Label("Rank Range",style={"color":P["muted"],"fontSize":"0.8rem"}),
+        dcc.RangeSlider(id="rank-slider", min=1, max=len(report), step=1,
+            value=[1,len(report)], marks={1:"1",len(report):str(len(report))},
+            tooltip={"placement":"bottom","always_visible":False}),
+    ], md=2),
+]))], style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"16px"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# TAB 1 — Overview
+tab_overview = dbc.Tab(label="📊 Overview", tab_id="tab-overview", children=[
+    dbc.Row([
+        dbc.Col(stat_card("Total Employees",    len(report),                          "users",          P["teal"]),  md=3),
+        dbc.Col(stat_card("BPS Levels",         report["highest_bps"].nunique(),      "layer-group",    P["gold"]),  md=3),
+        dbc.Col(stat_card("Qualifications",     report["qualification"].nunique(),    "graduation-cap", "#9B59B6"),  md=3),
+        dbc.Col(stat_card("Unique BPS (Tier 1)",(report["tier_label"]=="Tier 1 – Unique BPS").sum(),"trophy","#2ECC71"),md=3),
+    ], className="mb-4"),
+    dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Employees per BPS Level",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="chart-bps-dist",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=6),
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Tiebreaker Tier Distribution",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="chart-tier-pie",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=6),
+    ], className="mb-4"),
+    dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Qualification by BPS",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="chart-qual-bps",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=8),
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Joining Year",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="chart-join-year",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=4),
+    ]),
+])
+
+# TAB 2 — Seniority List (clean table + click-to-compare modal)
+tab_list = dbc.Tab(label="📋 Seniority List", tab_id="tab-list", children=[
+    dbc.Alert([
+        html.I(className="fas fa-mouse-pointer me-2",style={"color":P["teal"]}),
+        html.Span("Click any row to open a ", style={"color":P["text"]}),
+        html.B("Tier-by-Tier Comparison popup",  style={"color":P["teal"]}),
+        html.Span(" showing exactly who each employee is compared against and why their rank was decided.",
+                  style={"color":P["text"]}),
+        html.Span("  The ", style={"color":P["text"]}),
+        html.B("Tie Group", style={"color":P["gold"]}),
+        html.Span(" column shows how many employees share the same peak BPS + date.",
+                  style={"color":P["text"]}),
+    ], style={"background":"#1A2535","border":f"1px solid {P['teal']}","marginBottom":"12px"}),
+    html.Div(id="table-info",style={"color":P["muted"],"fontSize":"0.85rem","marginBottom":"8px"}),
+    dash_table.DataTable(
+        id="seniority-table",
+        columns=[
+            {"name":"Rank",         "id":"seniority_rank"},
+            {"name":"ArfNo",        "id":"ArfNo"},
+            {"name":"Name",         "id":"Namee"},
+            {"name":"Qualification","id":"qualification"},
+            {"name":"Peak BPS",     "id":"highest_bps"},
+            {"name":"BPS Date",     "id":"bps_date_fmt"},
+            {"name":"Tie Group",    "id":"tie_fmt"},
+            {"name":"Resolved By",  "id":"tier_label"},
+            {"name":"Govt Entry",   "id":"entry_fmt"},
+            {"name":"DOB",          "id":"dob_fmt"},
+            {"name":"Decision",     "id":"decision_basis"},
+            {"name":"Career Path",  "id":"seniority_path_readable"},
+        ],
+        page_size=15, sort_action="native", row_selectable="single",
+        style_table={"overflowX":"auto"},
+        style_header={"backgroundColor":P["slate"],"color":P["teal"],"fontWeight":"700",
+                      "border":f"1px solid {P['border']}","textTransform":"uppercase","fontSize":"0.75rem"},
+        style_cell={"backgroundColor":P["even"],"color":P["text"],"border":f"1px solid {P['border']}",
+                    "fontSize":"0.84rem","padding":"9px 12px",
+                    "maxWidth":"240px","overflow":"hidden","textOverflow":"ellipsis","whiteSpace":"nowrap"},
+        style_data_conditional=[
+            {"if":{"row_index":"odd"},"backgroundColor":P["odd"]},
+            {"if":{"column_id":"seniority_rank"},"fontWeight":"700","color":P["teal"],"textAlign":"center"},
+            {"if":{"column_id":"highest_bps"},   "fontWeight":"700","color":P["gold"],"textAlign":"center"},
+            {"if":{"column_id":"tie_fmt","filter_query":'{tied_group_size} > 1'},
+             "color":P["gold"],"fontWeight":"700"},
+            {"if":{"state":"selected"},"backgroundColor":"#2E4057","border":f"1px solid {P['teal']}"},
+            *[{"if":{"filter_query":f'{{tier_label}} = "{t}"',"column_id":"tier_label"},
+               "color":c,"fontWeight":"600"} for t,c in TIER_LABEL_COLORS.items()],
+        ],
+        tooltip_data=[], tooltip_delay=0, tooltip_duration=None,
+    ),
+])
+
+# TAB 3 — Employee Profile
+tab_employee = dbc.Tab(label="🔍 Employee Profile", tab_id="tab-employee", children=[
+    dbc.Row([
+        dbc.Col([
+            html.Label("Select Employee",style={"color":P["muted"],"fontSize":"0.8rem"}),
+            dcc.Dropdown(id="emp-selector",
+                options=[{"label":f"[{r.seniority_rank}] {r.Namee} (ArfNo {r.ArfNo})","value":r.ArfNo}
+                         for r in report.sort_values("seniority_rank").itertuples()],
+                placeholder="Choose an employee…",style={"color":"#000"}),
+        ], md=6),
+        dbc.Col(html.Div(id="emp-rank-badge",className="mt-4"), md=6),
+    ], className="mb-4"),
+    html.Div(id="emp-profile-cards",className="mb-4"),
+    dbc.Row([
+        dbc.Col(dcc.Graph(id="emp-career-timeline",config={"displayModeBar":False}),md=8),
+        dbc.Col(dcc.Graph(id="emp-bps-gauge",       config={"displayModeBar":False}),md=4),
+    ]),
+    dbc.Card([
+        dbc.CardHeader("Seniority Decision",
+                       style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody(html.Div(id="emp-decision-text")),
+    ], style={"background":P["card"],"border":f"1px solid {P['teal']}","marginTop":"16px"}),
+    # Beautiful comparison breakdown (same render function as modal)
+    dbc.Card([
+        dbc.CardHeader([
+            html.I(className="fas fa-balance-scale me-2",style={"color":P["gold"]}),
+            html.Span("Tier-by-Tier Comparison Breakdown",
+                      style={"color":P["gold"],"fontWeight":"700"}),
+        ], style={"background":P["slate"]}),
+        dbc.CardBody(html.Div(id="emp-comparison-body"),
+                     style={"background":P["navy"],"padding":"12px"}),
+    ], style={"background":P["card"],"border":f"2px solid {P['gold']}","marginTop":"16px"}),
+])
+
+# TAB 4 — BPS Deep Dive
+tab_bps = dbc.Tab(label="📈 BPS Deep Dive", tab_id="tab-bps", children=[
+    dbc.Card(dbc.CardBody(dbc.Row([
+        dbc.Col([
+            html.Label("Select BPS Level",style={"color":P["muted"],"fontSize":"0.8rem"}),
+            dcc.Dropdown(id="bps-group-selector",
+                options=[{"label":f"BPS {b}"+(""if b in BPS_WITH_DATA else" (no data)"),
+                          "value":b,"disabled":b not in BPS_WITH_DATA} for b in range(1,23)],
+                value=BPS_WITH_DATA[-1], clearable=False, style={"color":"#000"}),
+        ], md=4),
+        dbc.Col(html.Div(id="bps-summary-badges"),md=8,
+                style={"display":"flex","alignItems":"center","paddingTop":"10px"}),
+    ])), style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"16px"}),
+    dbc.Row([
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Ranked Members",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="bps-group-bar",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=7),
+        dbc.Col(dbc.Card([
+            dbc.CardHeader("Achievement Dates",style={"background":P["slate"],"color":P["text"]}),
+            dbc.CardBody(dcc.Graph(id="bps-group-timeline",config={"displayModeBar":False})),
+        ], style={"background":P["card"],"border":f"1px solid {P['border']}"}), md=5),
+    ], className="mb-4"),
+    dbc.Card([
+        dbc.CardHeader(dbc.Row([
+            dbc.Col("🔗 Tie Groups at this BPS Level",style={"color":P["teal"],"fontWeight":"700"},md=8),
+            dbc.Col(html.Div(id="tie-count-badge"),md=4,style={"textAlign":"right"}),
+        ]), style={"background":P["slate"]}),
+        dbc.CardBody(html.Div(id="tie-groups-panel")),
+    ], style={"background":P["card"],"border":f"2px solid {P['teal']}","marginBottom":"16px"}),
+    dbc.Card([
+        dbc.CardHeader("📊 Career Path Heatmap",style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody(dcc.Graph(id="bps-career-compare",config={"displayModeBar":False})),
+    ], style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"16px"}),
+    dbc.Card([
+        dbc.CardHeader("📋 Full Ranked Table",style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody(html.Div(id="bps-group-table")),
+    ], style={"background":P["card"],"border":f"1px solid {P['border']}"}),
+])
+
+# TAB 5 — All BPS Levels
+def build_accordion():
+    items = []
+    for bv in range(1,23):
+        le = all_events[all_events["bps_level"]==bv]
+        if le.empty: continue
+        le2 = le.groupby("ArfNo")["event_date"].min().reset_index(name="level_date")
+        df  = le2.merge(report, on="ArfNo", how="left").sort_values("seniority_rank")
+        df["ld_fmt"]  = df["level_date"].dt.strftime("%d-%b-%Y")
+        df["is_peak"] = df["highest_bps"]==bv
+        tg = {d:g for d,g in df.groupby("ld_fmt") if len(g)>1}
+        rows = [html.Tr([
+            html.Td(f"#{r.seniority_rank}", style={"color":P["teal"],"fontWeight":"700"}),
+            html.Td(r.Namee,                style={"color":P["text"]}),
+            html.Td(r.qualification,        style={"color":P["muted"],"fontSize":"0.8rem"}),
+            html.Td(r.ld_fmt,               style={"color":P["text"]}),
+            html.Td(dbc.Badge("Peak" if r.is_peak else f"→ BPS {r.highest_bps}",
+                               style={"backgroundColor":P["gold"] if r.is_peak else P["slate"],
+                                      "color":"#000" if r.is_peak else P["text"],"fontSize":"0.72rem"})),
+            html.Td(r.tier_label,           style={"color":TIER_LABEL_COLORS.get(r.tier_label,P["muted"]),
+                                                   "fontSize":"0.78rem","fontWeight":"600"}),
+            html.Td(r.decision_basis,       style={"color":P["muted"],"fontSize":"0.76rem"}),
+        ], style={"borderBottom":f"1px solid {P['border']}"}) for r in df.itertuples()]
+        body = html.Div([
+            dbc.Row([
+                dbc.Col(dbc.Badge(f"{len(df)} reached",color="info",   className="me-2 fs-6"),width="auto"),
+                dbc.Col(dbc.Badge(f"{int(df['is_peak'].sum())} peaked",color="primary",className="me-2 fs-6"),width="auto"),
+                dbc.Col(dbc.Badge(f"{len(tg)} tie group{'s'if len(tg)!=1 else''}",
+                                  color="warning"if tg else"success",className="me-2 fs-6"),width="auto"),
+            ], className="mb-3"),
+            html.Table([
+                html.Thead(html.Tr([html.Th(h,style={"color":P["teal"]}) for h in
+                    ["Rank","Name","Qualification","Date Reached","Status","Tier","Decision"]],
+                    style={"borderBottom":f"2px solid {P['teal']}"})),
+                html.Tbody(rows),
+            ], style={"width":"100%","borderCollapse":"collapse","fontSize":"0.84rem"}),
+        ])
+        items.append(dbc.AccordionItem(body, item_id=f"bps-{bv}",
+            title=f"BPS {bv}  ·  {len(df)} employees  ·  {int(df['is_peak'].sum())} peaked  ·  {len(tg)} tie group(s)"))
+    return items
+
+tab_all_bps = dbc.Tab(label="🗂️ All BPS Levels", tab_id="tab-all-bps", children=[
+    html.P("All BPS tiers at once. Click any row in the Seniority List tab for a full comparison popup.",
+           style={"color":P["muted"],"fontSize":"0.85rem","margin":"12px 0"}),
+    dbc.Accordion(build_accordion(), start_collapsed=False, always_open=True, id="all-bps-accordion"),
+])
+
+# TAB 6 — Career Paths
+tab_career = dbc.Tab(label="🗺️ Career Paths", tab_id="tab-career", children=[
+    dbc.Row([dbc.Col(dcc.Graph(id="career-sankey",  config={"displayModeBar":False}))],className="mb-4"),
+    dbc.Row([dbc.Col(dcc.Graph(id="career-scatter", config={"displayModeBar":False}))],className="mb-4"),
+    dbc.Card([
+        dbc.CardHeader("Full BPS Milestone History",style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody(html.Div(id="career-milestone-table")),
+    ], style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"16px"}),
+    dbc.Card([
+        dbc.CardHeader("First to Reach Each BPS Level",style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody(html.Div(id="career-first-to-reach")),
+    ], style={"background":P["card"],"border":f"1px solid {P['border']}"}),
+])
+
+# TAB 7 — Dataset Explorer
+tab_dataset = dbc.Tab(label="🧬 Dataset Explorer", tab_id="tab-dataset", children=[
+    dbc.Row([
+        dbc.Col(stat_card("Employee Records",    len(emp_raw),   "id-badge",    P["teal"]),md=3),
+        dbc.Col(stat_card("Promotion Records",   len(promo_raw), "arrow-up",    P["gold"]),md=3),
+        dbc.Col(stat_card("Reappointment Records",len(reapp_raw),"redo",        "#9B59B6"),md=3),
+        dbc.Col(stat_card("Total Career Events", len(all_events),"calendar-alt","#3498DB"),md=3),
+    ], className="mb-4"),
+    dbc.Card([
+        dbc.CardHeader("Data Quality Checks",style={"background":P["slate"],"color":P["text"]}),
+        dbc.CardBody([dq_alert(lv,ti,de) for lv,ti,de in DQ]),
+    ], style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"20px"}),
+    dbc.Tabs([
+        dbc.Tab(label="Employee Master",   children=[html.Div(raw_tbl(emp_raw,  "raw-emp"),  className="mt-3")]),
+        dbc.Tab(label="Promotions",        children=[html.Div(raw_tbl(promo_raw,"raw-promo"),className="mt-3")]),
+        dbc.Tab(label="Reappointments",    children=[html.Div(raw_tbl(reapp_raw,"raw-reapp"),className="mt-3")]),
+        dbc.Tab(label="All Career Events", children=[html.Div(raw_tbl(
+            all_events.assign(event_date=all_events["event_date"].dt.strftime("%d-%b-%Y"))
+                      .sort_values(["ArfNo","event_date"]), "raw-events"), className="mt-3")]),
+    ], className="mt-2"),
+])
+
+
+# TAB 8 — Tie-Break Audit (whole-group cascade: who's compared to whom, tier by tier)
+_tie_groups_df = (report[report["tied_group_size"] > 1]
+                   .groupby(["highest_bps", "bps_date_fmt"])["ArfNo"]
+                   .apply(list).reset_index()
+                   .sort_values("highest_bps", ascending=False))
+AUDIT_GROUP_OPTIONS = [
+    {"label": f"BPS {r.highest_bps}  ·  {r.bps_date_fmt}  ·  {len(r.ArfNo)} employees tied",
+     "value": f"{r.highest_bps}|{r.bps_date_fmt}"}
+    for r in _tie_groups_df.itertuples()
+]
+
+tab_audit = dbc.Tab(label="🥊 Tie-Break Audit", tab_id="tab-audit", children=[
+    dbc.Alert([
+        html.I(className="fas fa-sitemap me-2", style={"color": P["teal"]}),
+        html.Span("Pick a tied group below to see the ", style={"color": P["text"]}),
+        html.B("full cascade", style={"color": P["teal"]}),
+        html.Span(": every employee who started tied, and exactly which tier "
+                  "splits them apart from which other employees, step by step through "
+                  "all 6 tiers.", style={"color": P["text"]}),
+    ], style={"background": "#1A2535", "border": f"1px solid {P['teal']}", "marginBottom": "12px"}),
+    dbc.Row([
+        dbc.Col([
+            html.Label("Select a tied group (same Peak BPS + same Peak Date)",
+                       style={"color": P["muted"], "fontSize": "0.8rem"}),
+            dcc.Dropdown(id="audit-group-selector", options=AUDIT_GROUP_OPTIONS,
+                         placeholder=f"{len(AUDIT_GROUP_OPTIONS)} tied group(s) found — choose one…",
+                         style={"color": "#000"}),
+        ], md=8),
+        dbc.Col(html.Div(id="audit-group-badge", className="mt-4"), md=4),
+    ], className="mb-3"),
+    html.Div(id="audit-group-body"),
+])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APP LAYOUT
+# ─────────────────────────────────────────────────────────────────────────────
+app = dash.Dash(__name__,
+    external_stylesheets=[dbc.themes.CYBORG,
+        "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"],
+    title="Seniority Dashboard")
+server = app.server
+
+app.layout = html.Div([
+    # Header
+    html.Div([
+        html.Div([
+            html.H4("🏛️  Government Employee Seniority Dashboard",
+                    style={"color":P["text"],"fontWeight":"700","marginBottom":"2px"}),
+            html.P(f"{len(report)} employees  ·  6-tier tiebreaker  ·  Click any row for comparison popup",
+                   style={"color":P["muted"],"fontSize":"0.85rem","margin":"0"}),
+        ]),
+        dbc.Button("↻ Refresh", id="refresh-btn", color="info", size="sm", outline=True,
+                   style={"borderColor":P["teal"],"color":P["teal"]}),
+    ], style={"background":P["navy"],"padding":"16px 24px","display":"flex",
+              "justifyContent":"space-between","alignItems":"center",
+              "borderBottom":f"2px solid {P['teal']}","marginBottom":"20px"}),
+
+    dbc.Container([
+        filter_bar,
+        dbc.Tabs([tab_overview, tab_list, tab_employee,
+                  tab_bps, tab_all_bps, tab_career, tab_audit, tab_dataset],
+                 id="main-tabs", active_tab="tab-overview"),
+    ], fluid=True),
+
+    # Comparison popup modal
+    comparison_modal,
+    dcc.Store(id="selected-arf"),
+
+], style={"background":"#111B27","minHeight":"100vh","fontFamily":"'Segoe UI', sans-serif"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def apply_filters(search, bps_vals, qual_vals, rank_range):
+    df = report.copy()
+    if search:
+        s = search.strip().lower()
+        df = df[df["Namee"].str.lower().str.contains(s)|df["ArfNo"].astype(str).str.contains(s)]
+    if bps_vals:  df = df[df["highest_bps"].isin(bps_vals)]
+    if qual_vals: df = df[df["qualification"].isin(qual_vals)]
+    if rank_range:
+        df = df[(df["seniority_rank"]>=rank_range[0])&(df["seniority_rank"]<=rank_range[1])]
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Overview
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("chart-bps-dist","figure"), Output("chart-tier-pie","figure"),
+    Output("chart-qual-bps","figure"), Output("chart-join-year","figure"),
+    Input("search-input","value"), Input("bps-filter","value"),
+    Input("qual-filter","value"),  Input("rank-slider","value"),
+)
+def update_overview(search, bps_vals, qual_vals, rank_range):
+    df = apply_filters(search, bps_vals, qual_vals, rank_range)
+    bc = df.groupby("highest_bps").size().reset_index(name="count")
+    f1 = px.bar(bc, x="highest_bps", y="count", color="count",
+                 color_continuous_scale="Teal",
+                 labels={"highest_bps":"BPS Level","count":"Employees"})
+    f1.update_layout(**CHART_BASE, coloraxis_showscale=False)
+    f1.update_traces(marker_line_width=0)
+
+    tc = df.groupby("tier_label").size().reset_index(name="count")
+    f2 = px.pie(tc, names="tier_label", values="count", color="tier_label",
+                 color_discrete_map=TIER_LABEL_COLORS, hole=0.45)
+    f2.update_layout(**CHART_BASE)
+    f2.update_traces(textfont_color="#fff")
+
+    qc = df.groupby(["qualification","highest_bps"]).size().reset_index(name="count")
+    f3 = px.bar(qc, x="qualification", y="count", color="highest_bps", barmode="stack",
+                 color_continuous_scale="Viridis",
+                 labels={"count":"Employees","highest_bps":"BPS"})
+    f3.update_layout(**CHART_BASE, coloraxis_showscale=True)
+
+    df2 = df.copy()
+    df2["join_year"] = pd.to_datetime(emp_raw.set_index("ArfNo").reindex(df2["ArfNo"])["DateOfJoining"].values).year
+    f4 = px.histogram(df2, x="join_year", nbins=20,
+                       color_discrete_sequence=[P["teal"]], labels={"join_year":"Year"})
+    f4.update_layout(**CHART_BASE)
+    f4.update_traces(marker_line_width=0)
+    return f1, f2, f3, f4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Seniority Table
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("seniority-table","data"), Output("seniority-table","tooltip_data"),
+    Output("table-info","children"),
+    Input("search-input","value"), Input("bps-filter","value"),
+    Input("qual-filter","value"),  Input("rank-slider","value"),
+)
+def update_table(search, bps_vals, qual_vals, rank_range):
+    df = apply_filters(search, bps_vals, qual_vals, rank_range)
+    cols = ["seniority_rank","ArfNo","Namee","qualification","highest_bps",
+            "bps_date_fmt","tie_fmt","tier_label","entry_fmt","dob_fmt",
+            "decision_basis","seniority_path_readable","tied_group_size"]
+    recs = df[cols].to_dict("records")
+    tips = [{
+        "decision_basis":        {"value":r["decision_basis"],          "type":"text"},
+        "seniority_path_readable":{"value":r["seniority_path_readable"],"type":"text"},
+        "tier_label":            {"value":"Click this row for full comparison breakdown","type":"text"},
+    } for r in recs]
+    return recs, tips, f"Showing {len(df)} of {len(report)} employees  ·  Click any row to compare"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Row click → store ArfNo → open modal
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("selected-arf","data"),
+    Input("seniority-table","selected_rows"),
+    State("seniority-table","data"),
+    prevent_initial_call=True,
+)
+def store_selected(sel_rows, data):
+    if not sel_rows: return dash.no_update
+    return data[sel_rows[0]]["ArfNo"]
+
+
+@app.callback(
+    Output("comparison-modal","is_open"),
+    Output("modal-title","children"),
+    Output("modal-body","children"),
+    Input("selected-arf","data"),
+    Input("modal-close","n_clicks"),
+    State("comparison-modal","is_open"),
+    prevent_initial_call=True,
+)
+def toggle_modal(arf, close_clicks, is_open):
+    ctx = dash.callback_context.triggered[0]["prop_id"]
+    if "modal-close" in ctx:
+        return False, dash.no_update, dash.no_update
+    if arf is None:
+        return False, dash.no_update, dash.no_update
+    row   = report[report["ArfNo"]==arf].iloc[0]
+    title = f"Comparison: {row['Namee']}  (Rank #{row['seniority_rank']}  ·  ArfNo {arf})"
+    body  = render_comparison_modal(arf)
+    return True, title, body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Employee Profile
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("emp-selector","value"), Output("main-tabs","active_tab"),
+    Input("seniority-table","selected_rows"), State("seniority-table","data"),
+    prevent_initial_call=True,
+)
+def row_to_profile(sel, data):
+    if not sel: return dash.no_update, dash.no_update
+    return data[sel[0]]["ArfNo"], "tab-employee"
+
+
+@app.callback(
+    Output("emp-rank-badge","children"), Output("emp-profile-cards","children"),
+    Output("emp-career-timeline","figure"), Output("emp-bps-gauge","figure"),
+    Output("emp-decision-text","children"), Output("emp-comparison-body","children"),
+    Input("emp-selector","value"),
+)
+def update_employee(arf):
+    ef = go.Figure(); ef.update_layout(**CHART_BASE)
+    if arf is None: return "", [], ef, ef, "Select an employee above.", ""
+
+    row  = report[report["ArfNo"]==arf].iloc[0]
+    evts = all_events[all_events["ArfNo"]==arf].sort_values("event_date")
+
+    pct   = 1-(row["seniority_rank"]-1)/max(len(report)-1,1)
+    bcol  = "#2ECC71" if pct>=0.75 else "#F39C12" if pct>=0.40 else "#E74C3C"
+    badge = html.Div([
+        html.Span(f"Rank #{row['seniority_rank']} of {len(report)}",
+                  style={"fontSize":"1.6rem","fontWeight":"700","color":bcol}),
+        html.Span(f"  ·  Top {100*(1-pct):.0f}%",
+                  style={"color":P["muted"],"fontSize":"0.9rem"}),
+    ])
+    cards = dbc.Row([
+        dbc.Col(stat_card("BPS",        row["highest_bps"],   "star",           P["gold"]),  md=3),
+        dbc.Col(stat_card("BPS Date",   row["bps_date_fmt"],  "calendar-check", P["teal"]),  md=3),
+        dbc.Col(stat_card("Govt Entry", row["entry_fmt"],     "door-open",      "#9B59B6"),  md=3),
+        dbc.Col(stat_card("Qual",       row["qualification"], "graduation-cap", "#3498DB"),  md=3),
+    ])
+    src_c = {"Joining":"#3498DB","Reappointment":"#2ECC71","Promotion":"#F39C12"}
+    fig_tl = go.Figure()
+    for _,e in evts.iterrows():
+        fig_tl.add_trace(go.Scatter(x=[e["event_date"]],y=[e["bps_level"]],mode="markers+text",
+            marker=dict(size=18,color=src_c.get(e["source"],"grey"),line=dict(width=2,color="#fff")),
+            text=[f"BPS {int(e['bps_level'])}"],textposition="top center",
+            name=e["source"],showlegend=True,
+            hovertemplate=f"<b>{e['source']}</b><br>BPS: {int(e['bps_level'])}<br>"
+                          f"Date: {e['event_date'].strftime('%d-%b-%Y')}<extra></extra>"))
+    if len(evts)>1:
+        fig_tl.add_trace(go.Scatter(x=evts["event_date"],y=evts["bps_level"],mode="lines",
+            line=dict(color=P["border"],dash="dot"),showlegend=False))
+    fig_tl.update_layout(**CHART_BASE,title=f"Career Timeline — {row['Namee']}",
+        xaxis_title="Date",yaxis_title="BPS Level",legend=dict(orientation="h",y=-0.2))
+
+    mbps = int(report["highest_bps"].max())
+    fig_g = go.Figure(go.Indicator(mode="gauge+number",value=int(row["highest_bps"]),
+        domain={"x":[0,1],"y":[0,1]},
+        title={"text":"Current BPS","font":{"color":P["text"]}},
+        gauge={"axis":{"range":[1,mbps],"tickcolor":P["text"],"tickfont":{"color":P["text"]}},
+               "bar":{"color":P["teal"]},"bgcolor":"rgba(0,0,0,0)","borderwidth":1,
+               "bordercolor":P["border"],
+               "steps":[{"range":[1,7],"color":"#1A2535"},{"range":[7,14],"color":"#1E2D40"},
+                         {"range":[14,mbps],"color":"#223044"}],
+               "threshold":{"line":{"color":P["gold"],"width":4},"thickness":0.75,
+                             "value":row["highest_bps"]}},
+        number={"font":{"color":P["text"]}}))
+    fig_g.update_layout(**CHART_BASE,height=280)
+
+    tc  = TIER_LABEL_COLORS.get(row["tier_label"],P["teal"])
+    dec = html.Div([
+        html.Div([html.Span("Tier: ",style={"color":P["muted"]}),
+                  html.Span(row["tier_label"],style={"color":tc,"fontWeight":"700"})],className="mb-2"),
+        html.Div([html.Span("Decision: ",style={"color":P["muted"]}),
+                  html.Span(row["decision_basis"],style={"color":P["text"]})],className="mb-3"),
+        html.Hr(style={"borderColor":P["border"]}),
+        html.P("Full Career Path:",style={"color":P["muted"],"marginBottom":"6px"}),
+        html.Div([dbc.Badge(s.strip(),color="info",className="me-2 mb-1",style={"fontSize":"0.8rem"})
+                  for s in row["seniority_path_readable"].split("→")]),
+    ])
+    comp_body = render_comparison_modal(arf)
+    return badge, cards, fig_tl, fig_g, dec, comp_body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — BPS Deep Dive
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("bps-group-bar","figure"),   Output("bps-group-timeline","figure"),
+    Output("bps-summary-badges","children"), Output("tie-count-badge","children"),
+    Output("tie-groups-panel","children"),   Output("bps-career-compare","figure"),
+    Output("bps-group-table","children"),
+    Input("bps-group-selector","value"),
+)
+def update_bps(bps_val):
+    le = all_events[all_events["bps_level"]==bps_val].copy()
+    ef = go.Figure(); ef.update_layout(**CHART_BASE)
+    if le.empty:
+        ef.update_layout(annotations=[dict(text=f"No data for BPS {bps_val}",showarrow=False,
+                                           font=dict(color=P["muted"],size=14))])
+        return ef,ef,[dbc.Badge(f"0 Members",color="secondary",className="me-2 fs-6")],\
+               dbc.Badge("No data",color="secondary",className="fs-6"),\
+               html.Div("No records.",style={"color":P["muted"],"padding":"12px"}),ef,\
+               html.Div("No records.",style={"color":P["muted"],"padding":"12px"})
+
+    le2  = le.groupby("ArfNo")["event_date"].min().reset_index(name="level_date")
+    df   = le2.merge(report, on="ArfNo", how="left").sort_values("seniority_rank").copy()
+    df["ld_fmt"]  = df["level_date"].dt.strftime("%d-%b-%Y")
+    df["is_peak"] = df["highest_bps"]==bps_val
+    evts = le.merge(df[["ArfNo","seniority_rank"]],on="ArfNo")
+    tc   = (df.groupby("ld_fmt")["ArfNo"].count()>1).sum()
+    pc   = int(df["is_peak"].sum())
+
+    badges = [
+        dbc.Badge(f"{len(df)} Members at BPS {bps_val}",color="info",    className="me-2 fs-6"),
+        dbc.Badge(f"{pc} peaked here",                  color="primary",  className="me-2 fs-6"),
+        dbc.Badge(f"{len(df)-pc} moved on",             color="secondary",className="me-2 fs-6"),
+        dbc.Badge(f"{tc} tie group{'s'if tc!=1 else''}", color="warning"if tc else"success",className="me-2 fs-6"),
+    ]
+    df["label"] = df["Namee"]+"  (#"+df["seniority_rank"].astype(str)+")"
+    f_bar = px.bar(df.sort_values("seniority_rank",ascending=False), x="seniority_rank", y="label",
+        orientation="h", color="is_peak",
+        color_discrete_map={True:P["gold"],False:P["teal"]},
+        labels={"seniority_rank":"Overall Rank","label":"","is_peak":"Peak?"},
+        text="seniority_rank",hover_data={"decision_basis":True,"qualification":True})
+    f_bar.update_layout(**CHART_BASE, title=f"BPS {bps_val} — Members (overall rank)",
+        showlegend=True, legend=dict(orientation="h",y=-0.25),height=max(320,len(df)*40))
+    f_bar.update_traces(textposition="outside",cliponaxis=False)
+
+    f_tl = px.scatter(evts,x="event_date",y="Namee",color="source",symbol="source",
+        color_discrete_map={"Joining":"#3498DB","Reappointment":"#2ECC71","Promotion":"#F39C12"},
+        labels={"event_date":"Date","Namee":""},title=f"BPS {bps_val} — Dates Reached",
+        hover_data={"seniority_rank":True})
+    for dt,cnt in evts.groupby("event_date")["ArfNo"].nunique().items():
+        if cnt>1:
+            f_tl.add_vline(x=dt,line_dash="dash",line_color=P["gold"],
+                annotation_text=f"TIE ({cnt})",annotation_font_color=P["gold"],annotation_font_size=10)
+    f_tl.update_layout(**CHART_BASE,height=max(300,len(df)*35),legend=dict(orientation="h",y=-0.25))
+
+    # Tie group cards
+    tg  = {d:g for d,g in df.groupby("ld_fmt") if len(g)>1}
+    sg  = {d:g for d,g in df.groupby("ld_fmt") if len(g)==1}
+    tb  = dbc.Badge(f"{len(tg)} tie group{'s'if len(tg)!=1 else''}  ·  "
+                    f"{sum(len(g) for g in tg.values())} tied",
+                    color="warning"if tg else"success",className="fs-6")
+    panels = []
+    if not tg:
+        panels.append(html.Div([html.I(className="fas fa-check-circle me-2",style={"color":"#2ECC71"}),
+            html.Span(f"All unique dates at BPS {bps_val}.",style={"color":P["text"]})],className="p-3"))
+    else:
+        for ds,grp in sorted(tg.items()):
+            grp = grp.sort_values("seniority_rank")
+            rows=[html.Tr([
+                html.Td(f"#{r.seniority_rank}",style={"color":P["teal"],"fontWeight":"700","width":"60px"}),
+                html.Td(r.Namee,style={"color":P["text"],"fontWeight":"600"}),
+                html.Td(r.qualification,style={"color":P["muted"],"fontSize":"0.8rem"}),
+                html.Td(f"BPS {r.highest_bps}"+(" (peak)"if r.is_peak else""),
+                        style={"color":P["gold"]if r.is_peak else P["muted"],"fontSize":"0.8rem"}),
+                html.Td(dbc.Badge(r.tier_label,
+                                  style={"backgroundColor":TIER_LABEL_COLORS.get(r.tier_label,"grey"),
+                                         "fontSize":"0.72rem"})),
+                html.Td(r.decision_basis,style={"color":P["muted"],"fontSize":"0.76rem"}),
+            ],style={"borderBottom":f"1px solid {P['border']}"}) for r in grp.itertuples()]
+            panels.append(dbc.Card([
+                dbc.CardHeader([
+                    html.I(className="fas fa-link me-2",style={"color":P["gold"]}),
+                    html.Span(f"Reached BPS {bps_val} on {ds}  ·  {len(grp)} employees tied",
+                              style={"color":P["gold"],"fontWeight":"700"}),
+                ],style={"background":"#1A2535"}),
+                dbc.CardBody(html.Table([
+                    html.Thead(html.Tr([html.Th(h,style={"color":P["teal"]}) for h in
+                        ["Rank","Name","Qual","Eventual Peak","Tier","Decision"]],
+                        style={"borderBottom":f"2px solid {P['teal']}"})),
+                    html.Tbody(rows),
+                ],style={"width":"100%","borderCollapse":"collapse","fontSize":"0.83rem"})),
+            ],style={"background":P["card"],"border":f"1px solid {P['gold']}","marginBottom":"12px"}))
+    if sg:
+        sr=[html.Tr([
+            html.Td(f"#{grp.iloc[0]['seniority_rank']}",style={"color":P["teal"],"fontWeight":"700"}),
+            html.Td(grp.iloc[0]["Namee"],               style={"color":P["text"]}),
+            html.Td(ds,                                 style={"color":P["muted"],"fontSize":"0.8rem"}),
+            html.Td(dbc.Badge("Unique date",color="success",style={"fontSize":"0.72rem"})),
+        ],style={"borderBottom":f"1px solid {P['border']}"}) for ds,grp in sorted(sg.items())]
+        panels.append(dbc.Card([
+            dbc.CardHeader("✅ Unique dates",style={"background":"#1A2535","color":"#2ECC71"}),
+            dbc.CardBody(html.Table([
+                html.Thead(html.Tr([html.Th(h,style={"color":P["teal"]}) for h in
+                    ["Rank","Name","Date","Status"]],
+                    style={"borderBottom":f"2px solid {P['teal']}"})),
+                html.Tbody(sr),
+            ],style={"width":"100%","borderCollapse":"collapse","fontSize":"0.82rem"})),
+        ],style={"background":P["card"],"border":f"1px solid {P['border']}","marginBottom":"12px"}))
+
+    # Heatmap
+    ae2  = all_events[all_events["ArfNo"].isin(df["ArfNo"])].copy()
+    rm   = df.set_index("Namee")["seniority_rank"].to_dict()
+    pm   = ae2.groupby(["Namee","bps_level"])["event_date"].min().reset_index()
+    pm["year"] = pm["event_date"].dt.year
+    pm["nr"]   = pm["Namee"].map(rm)
+    pm   = pm.sort_values("nr")
+    f_cm = px.density_heatmap(pm,x="bps_level",y="Namee",z="year",
+        color_continuous_scale="Teal",histfunc="avg",
+        labels={"bps_level":"BPS Level","Namee":"","year":"Year"},
+        title=f"Full Career History — everyone through BPS {bps_val}",
+        category_orders={"Namee":pm["Namee"].tolist()})
+    f_cm.update_layout(**CHART_BASE,height=max(320,len(df)*38))
+    f_cm.update_xaxes(tickmode="linear",dtick=1,gridcolor=P["border"])
+
+    # Full table
+    tbl_df = df[["seniority_rank","ArfNo","Namee","qualification","ld_fmt","is_peak",
+                 "highest_bps","bps_date_fmt","entry_fmt","dob_fmt",
+                 "tier_label","decision_basis","seniority_path_readable"]].copy()
+    tbl_df["is_peak"] = tbl_df["is_peak"].map({True:"Yes (peak)",False:"No — moved on"})
+    tbl = dash_table.DataTable(
+        data=tbl_df.to_dict("records"),
+        columns=[
+            {"name":"Rank","id":"seniority_rank"}, {"name":"ArfNo","id":"ArfNo"},
+            {"name":"Name","id":"Namee"},           {"name":"Qual","id":"qualification"},
+            {"name":f"Date @ BPS {bps_val}","id":"ld_fmt"},
+            {"name":"Peaked?","id":"is_peak"},      {"name":"Peak BPS","id":"highest_bps"},
+            {"name":"Peak Date","id":"bps_date_fmt"},{"name":"Entry","id":"entry_fmt"},
+            {"name":"DOB","id":"dob_fmt"},          {"name":"Tier","id":"tier_label"},
+            {"name":"Decision","id":"decision_basis"},
+            {"name":"Career Path","id":"seniority_path_readable"},
+        ],
+        sort_action="native",page_size=20,style_table={"overflowX":"auto"},
+        style_header={"backgroundColor":P["slate"],"color":P["teal"],"fontWeight":"700",
+                      "border":f"1px solid {P['border']}","fontSize":"0.75rem","textTransform":"uppercase"},
+        style_cell={"backgroundColor":P["even"],"color":P["text"],"border":f"1px solid {P['border']}",
+                    "fontSize":"0.82rem","padding":"7px 10px",
+                    "maxWidth":"220px","overflow":"hidden","textOverflow":"ellipsis","whiteSpace":"nowrap"},
+        style_data_conditional=[
+            {"if":{"row_index":"odd"},"backgroundColor":P["odd"]},
+            {"if":{"column_id":"seniority_rank"},"color":P["teal"],"fontWeight":"700","textAlign":"center"},
+            {"if":{"column_id":"highest_bps"},   "color":P["gold"],"fontWeight":"700","textAlign":"center"},
+            *[{"if":{"filter_query":f'{{tier_label}} = "{t}"',"column_id":"tier_label"},
+               "color":c,"fontWeight":"600"} for t,c in TIER_LABEL_COLORS.items()],
+        ],
+        tooltip_data=[{"decision_basis":{"value":r["decision_basis"],"type":"text"},
+                       "seniority_path_readable":{"value":r["seniority_path_readable"],"type":"text"}}
+                      for r in tbl_df.to_dict("records")],
+        tooltip_delay=0, tooltip_duration=None,
+    )
+    return f_bar, f_tl, badges, tb, panels, f_cm, tbl
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Career Paths
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("career-sankey","figure"), Output("career-scatter","figure"),
+    Input("search-input","value"), Input("bps-filter","value"),
+    Input("qual-filter","value"),  Input("rank-slider","value"),
+)
+def update_career(search, bps_vals, qual_vals, rank_range):
+    df  = apply_filters(search, bps_vals, qual_vals, rank_range)
+    ev  = all_events[all_events["ArfNo"].isin(df["ArfNo"])]
+    jb  = ev[ev["source"]=="Joining"].groupby("ArfNo")["bps_level"].first().reset_index(name="join_bps")
+    mg  = df[["ArfNo","highest_bps"]].merge(jb,on="ArfNo",how="left")
+    fl  = mg.groupby(["join_bps","highest_bps"]).size().reset_index(name="count")
+    fl  = fl[fl["join_bps"].notna()&fl["highest_bps"].notna()]
+    an  = sorted(set(fl["join_bps"].tolist()+fl["highest_bps"].tolist()))
+    ni  = {v:i for i,v in enumerate(an)}
+    fs  = go.Figure(go.Sankey(
+        node=dict(label=[f"BPS {int(n)}" for n in an],color=[P["teal"]]*len(an),pad=20,thickness=18),
+        link=dict(source=[ni[r["join_bps"]] for _,r in fl.iterrows()],
+                  target=[ni[r["highest_bps"]] for _,r in fl.iterrows()],
+                  value=fl["count"].tolist(),color="rgba(26,188,156,0.25)")))
+    fs.update_layout(**CHART_BASE,title="Career Flow: Joining BPS → Peak BPS",height=420)
+    sc = df.copy(); sc["entry_year"]=pd.to_datetime(sc["dateofentryingov"]).dt.year
+    fsc=px.scatter(sc,x="entry_year",y="highest_bps",color="qualification",size_max=12,
+        hover_data={"Namee":True,"seniority_rank":True,"decision_basis":True},
+        labels={"entry_year":"Govt Entry Year","highest_bps":"Peak BPS"},
+        title="Govt Entry Year vs Peak BPS Level")
+    fsc.update_layout(**CHART_BASE,height=380)
+    return fs,fsc
+
+
+@app.callback(
+    Output("career-milestone-table","children"), Output("career-first-to-reach","children"),
+    Input("search-input","value"), Input("bps-filter","value"),
+    Input("qual-filter","value"),  Input("rank-slider","value"),
+)
+def update_career_tables(search, bps_vals, qual_vals, rank_range):
+    df  = apply_filters(search, bps_vals, qual_vals, rank_range)
+    ev  = all_events[all_events["ArfNo"].isin(df["ArfNo"])].copy()
+    ev  = ev.merge(df[["ArfNo","seniority_rank"]],on="ArfNo").sort_values(["seniority_rank","event_date"])
+    ev["ed_fmt"] = ev["event_date"].dt.strftime("%d-%b-%Y")
+    sc  = {"Joining":"#3498DB","Reappointment":"#2ECC71","Promotion":"#F39C12"}
+    mr  = [html.Tr([
+        html.Td(f"#{r['seniority_rank']}",style={"color":P["teal"],"fontWeight":"700"}),
+        html.Td(r["Namee"],style={"color":P["text"]}),
+        html.Td(dbc.Badge(r["source"],style={"backgroundColor":sc.get(r["source"],"grey"),"fontSize":"0.72rem"})),
+        html.Td(f"BPS {int(r['bps_level'])}",style={"color":P["gold"],"fontWeight":"700"}),
+        html.Td(r["ed_fmt"],style={"color":P["text"]}),
+    ],style={"borderBottom":f"1px solid {P['border']}"}) for _,r in ev.iterrows()]
+    mt  = html.Table([
+        html.Thead(html.Tr([html.Th(h,style={"color":P["teal"]}) for h in
+            ["Rank","Name","Event","BPS","Date"]],style={"borderBottom":f"2px solid {P['teal']}"})),
+        html.Tbody(mr),
+    ],style={"width":"100%","borderCollapse":"collapse","fontSize":"0.85rem"})
+    bf  = ev.groupby("bps_level").apply(lambda g: g.loc[g["event_date"].idxmin()],include_groups=False).reset_index()
+    fr  = [html.Tr([
+        html.Td(f"BPS {int(r['bps_level'])}",style={"color":P["gold"],"fontWeight":"700"}),
+        html.Td(r["Namee"],style={"color":P["text"],"fontWeight":"600"}),
+        html.Td(f"#{int(r['seniority_rank'])}",style={"color":P["teal"]}),
+        html.Td(r["event_date"].strftime("%d-%b-%Y"),style={"color":P["text"]}),
+        html.Td(dbc.Badge(r["source"],style={"backgroundColor":sc.get(r["source"],"grey"),"fontSize":"0.72rem"})),
+    ],style={"borderBottom":f"1px solid {P['border']}"}) for _,r in bf.sort_values("bps_level",ascending=False).iterrows()]
+    ft  = html.Table([
+        html.Thead(html.Tr([html.Th(h,style={"color":P["teal"]}) for h in
+            ["BPS","Earliest Achiever","Rank","Date","Via"]],style={"borderBottom":f"2px solid {P['teal']}"})),
+        html.Tbody(fr),
+    ],style={"width":"100%","borderCollapse":"collapse","fontSize":"0.85rem"})
+    return mt, ft
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACKS — Tie-Break Audit
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("audit-group-badge", "children"),
+    Output("audit-group-body", "children"),
+    Input("audit-group-selector", "value"),
+)
+def update_audit(group_key):
+    if not group_key:
+        return "", html.Div("Select a tied group above to see the full comparison cascade.",
+                             style={"color": P["muted"], "padding": "12px", "fontStyle": "italic"})
+    bps_str, date_str = group_key.split("|", 1)
+    bps = int(bps_str)
+    arfs = report[(report["highest_bps"] == bps) & (report["bps_date_fmt"] == date_str)]["ArfNo"].tolist()
+    badge = dbc.Badge(f"{len(arfs)} employees start tied at BPS {bps}  ·  {date_str}",
+                       color="warning", className="fs-6")
+    cascade = build_group_cascade(arfs)
+    body = render_cascade(cascade)
+    return badge, body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__=="__main__":
+    print("\n"+"="*60)
+    print("  Seniority Dashboard — http://127.0.0.1:8050")
+    print("="*60+"\n")
+    app.run(debug=True, port=8050)
