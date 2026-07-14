@@ -69,7 +69,7 @@ from sqlalchemy.engine import URL
 # DATABASE CONNECTION
 # ─────────────────────────────────────────────────────────────────────────────
 DB_USER     = os.environ.get("DB_USER", "root")
-DB_PASSWORD = os.environ.get("DB_PASSWORD", "Netflix@55")   # <-- set this
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "DB_PASSWORD")   # <-- set this
 DB_HOST     = os.environ.get("DB_HOST", "127.0.0.1")
 DB_PORT     = int(os.environ.get("DB_PORT", "3306"))
 DB_SCHEMA   = os.environ.get("DB_SCHEMA", "pac_erp_care")
